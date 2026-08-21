@@ -1,113 +1,167 @@
-# Containerized FastAPI Inference Service
+# Docker Networking Demo - API + Database on a Custom Network
 
-A small prediction API built with FastAPI and packaged as a production-grade Docker image. The model itself is intentionally simple (it just doubles the input) - the point of this project is the containerization, not the math. The request/response shape is the same one real model servers use, so swapping in an actual ML model later doesn't change anything else.
+Two containers talking to each other by name: a FastAPI prediction service and a PostgreSQL database, connected over a user-defined Docker network. Every prediction the API makes is stored in the database and can be read back through a `/history` endpoint.
+
+This is the follow-up to the single-container inference project. That one taught you how to build and ship an image. This one teaches what real applications need next: containers working together.
 
 Built by **Manish Kumar** - [LinkedIn](https://www.linkedin.com/in/manishsinghkuswaha/)
 
-## Why this exists
+## What this demonstrates
 
-Every developer has hit the "works on my machine" problem: the app runs fine locally, then breaks on the server because of a different Python version or a missing library.
+- Why `localhost` does not work between containers (each container is its own isolated box)
+- Custom (user-defined) bridge networks and the built-in DNS that comes with them
+- Containers reaching each other by container NAME instead of fragile IPs
+- Passing configuration through environment variables instead of hardcoding
+- Why the database gets no published port - and why that makes it safer
+- Network isolation: containers outside the network cannot even resolve the name
 
-This project packages the app together with its entire environment into a single versioned image. Build it once, run it anywhere - laptop, EC2, Kubernetes - and it behaves exactly the same.
-
-## What's in here
+## Project structure
 
 ```
-inference-service/
-├── app.py              # the API (two endpoints: /predict and /health)
-├── requirements.txt    # pinned dependencies
-├── .dockerignore       # keeps junk and secrets out of the image
-├── Dockerfile          # the build recipe
+network-demo/
+├── app.py              # FastAPI service: /predict, /history, /health
+├── requirements.txt    # fastapi, uvicorn, psycopg2-binary (all pinned)
+├── Dockerfile          # same production pattern as the inference project
 └── README.md
 ```
 
-Stack: FastAPI (the API framework), Uvicorn (the server that runs it), Docker.
+The interesting line in `app.py` is this one:
 
-## Setup
-
-You need the Docker CLI and a running daemon. Docker Desktop works fine. If you can't install it (license reasons etc.), Colima does the same job on macOS:
-
-```bash
-brew install colima docker
-colima start
-docker run hello-world    # sanity check
+```python
+DB_HOST = os.getenv("DB_HOST", "localhost")
 ```
 
-Two Colima gotchas I ran into myself:
-- `docker not found` when starting colima - the CLI is a separate install, run `brew install docker`
-- `docker-credential-osxkeychain not found` on first pull - leftover Docker Desktop config. Fix: `echo '{}' > ~/.docker/config.json`
+The code never knows where the database is. It reads the address from an environment variable, and we pass the container name (`db`) at run time. Docker's DNS does the rest. This is the standard pattern for configuring containers.
 
-## Running it
+There is also a retry loop on startup - the API tries to reach the database up to 10 times before giving up. Containers start in whatever order they want, so real apps must tolerate a dependency that is not ready yet.
+
+## Prerequisites
+
+Docker CLI + a running daemon (Docker Desktop or Colima). Pull the Postgres image before class/demo if your internet is slow: `docker pull postgres:16` (~140 MB).
+
+## Step-by-step walkthrough
+
+Run these in order. Each step explains what the command does and why you see the output you see.
+
+### Step 1 - Build the API image
 
 ```bash
-docker build -t inference:1.0 .
-docker run -d -p 8000:8000 --name inference inference:1.0
+docker build -t predict-api:1.0 .
+```
 
+**What it does:** reads the Dockerfile and builds an image, tagging it `predict-api:1.0`.
+
+**Why the output looks like that:** you'll see one step per Dockerfile instruction - each becomes a layer. The pip install step takes the longest because it downloads fastapi, uvicorn and the Postgres driver. If you rebuild without changes, every step says `CACHED` and finishes in about a second - that's the layer cache.
+
+### Step 2 - Create the network
+
+```bash
+docker network create app-net
+```
+
+**What it does:** creates a user-defined bridge network - a private "hallway" that containers can be plugged into.
+
+**Why we need it:** the default bridge network has no DNS, so containers there can only reach each other by IP - and container IPs change on every restart. A custom network gives us name-based lookup for free.
+
+**Why the output looks like that:** Docker prints a long hex string. That's just the network's ID. Run `docker network ls` and you'll see `app-net` listed next to the default `bridge`.
+
+### Step 3 - Start the database on the network
+
+```bash
+docker run -d --name db --network app-net \
+  -e POSTGRES_PASSWORD=secret123 postgres:16
+```
+
+**What it does:** starts Postgres in the background (`-d`), names the container `db`, plugs it into `app-net`, and sets the password Postgres requires via an environment variable (`-e`).
+
+**Two things to notice:**
+- The name `db` is not decoration - on a custom network, the container name becomes its hostname. Every container on `app-net` can now reach this database at the address `db`.
+- There is deliberately NO `-p` flag. The database never talks to the outside world, only to the API - and the API is inside the network. A port that is not published cannot be scanned or attacked. Publish ports only for the service that actually faces users.
+
+**Why the output looks like that:** again just a container ID. `docker ps` shows the container with no entry under PORTS mapped to the host - that's the "no front door" proof.
+
+### Step 4 - Start the API on the same network
+
+```bash
+docker run -d --name api --network app-net -p 8000:8000 \
+  -e DB_HOST=db predict-api:1.0
+```
+
+**What it does:** starts our API, plugs it into the same network, publishes port 8000 (this one DOES face users, so it gets a door), and passes `DB_HOST=db` - literally telling the app "your database is at the address db".
+
+**Why this is the key command of the demo:** look at what we passed as the database address. Not an IP. Not localhost. The other container's NAME. The app code reads it from the environment and connects to it like any hostname.
+
+### Step 5 - The proof: read the API's logs
+
+```bash
+docker logs api
+```
+
+**What it does:** prints everything the API container has written to its output.
+
+**Why the output looks like that:** you'll see either `connected to db at host 'db' - table ready` straight away, or one or two `db not ready (attempt 1/10)` lines first and then the success line. The retries happen because Postgres takes a few seconds to initialize on first start - the API patiently retries until the database answers. That's the startup race, handled. The success line is Docker DNS working: the name `db` was resolved to the database container and a real TCP connection was made.
+
+### Step 6 - Make predictions
+
+```bash
 curl "http://localhost:8000/predict?x=21"
-# {"prediction": 42.0}
+curl "http://localhost:8000/predict?x=50"
 ```
 
-FastAPI also generates interactive docs automatically - open http://localhost:8000/docs in a browser and you can test the endpoints from there.
+**What it does:** calls the API from your machine, through the published port.
 
-## Endpoints
+**Why the output looks like that:** you get `{"prediction": 42.0, "saved": true}`. The `saved: true` is the interesting part - before answering you, the API wrote a row into Postgres. That request travelled: your terminal -> host port 8000 -> api container -> app-net -> db container, and back.
 
-| Method | Path | What it does |
-|---|---|---|
-| GET | `/predict?x=<number>` | returns `{"prediction": x*2}` |
-| GET | `/health` | returns `{"status": "ok"}` - used by the Docker healthcheck |
-| GET | `/docs` | Swagger UI |
-
-## Design notes
-
-A few deliberate choices in the Dockerfile, and what each one prevents:
-
-- **`python:3.12-slim` base, everything pinned** - reproducible builds; the same Dockerfile produces the same image in six months
-- **requirements.txt copied and installed before the code** - code edits don't invalidate the pip layer, so rebuilds take ~2 seconds instead of minutes
-- **runs as a non-root user (`appuser`)** - a container escape as root would mean root on the host
-- **`/health` endpoint wired to a Docker HEALTHCHECK** - "the process is running" is not the same as "the app is answering"; this lets Docker and orchestrators tell the difference
-- **`--host 0.0.0.0` in the CMD** - binding to 127.0.0.1 inside a container makes it unreachable through port mapping. Classic mistake, designed out
-- **`.dockerignore` excludes `.env`, `.git`, `venv/`** - image layers are permanent; a secret copied in once is extractable forever, even if a later layer deletes the file
-
-## Checking that it all works
-
-Each design decision can be verified with a command:
+### Step 7 - Read the history back
 
 ```bash
-curl "http://localhost:8000/predict?x=21"   # the API works
-docker ps                                   # STATUS shows (healthy) after ~30s
-docker exec -it inference whoami            # appuser, not root
-docker logs inference                       # request log
+curl "http://localhost:8000/history"
 ```
 
-## Publishing
+**What it does:** asks the API for the last 10 predictions - which it fetches from the database.
+
+**Why the output looks like that:** you see the predictions you just made, with timestamps, newest first. This is the round-trip proof: the data physically lives in one container and is being served by another, across the network.
+
+### Step 8 - The negative proof: off the network, the name doesn't exist
 
 ```bash
-docker login
-docker tag inference:1.0 YOUR_USER/inference:1.0
-docker push YOUR_USER/inference:1.0
+docker run --rm postgres:16 psql -h db -U postgres
 ```
 
-Don't deploy `:latest` in production - pin a version tag, and ideally add the git SHA so you always know exactly what's running.
+**What it does:** starts a throwaway Postgres client container (`--rm` deletes it when it exits) and tells it to connect to the host `db`. Note what's missing: no `--network app-net`.
+
+**Why the output looks like that:** it fails with `could not translate host name "db"`. This container landed on the default bridge - a different hallway. From there, the name `db` simply does not resolve. This failure is the isolation feature working: your database is invisible to anything you didn't explicitly put on its network.
+
+Now run the same command WITH the network and watch it succeed:
+
+```bash
+docker run -it --rm --network app-net postgres:16 psql -h db -U postgres
+# password: secret123 -> you get a postgres=# prompt
+```
+
+Same command, one flag difference, opposite result. That flag is the whole lesson.
+
+### Step 9 - Cleanup
+
+```bash
+docker rm -f api db
+docker network rm app-net
+```
+
+**What it does:** force-removes both containers (`-f` = stop and remove in one go), then removes the network. Networks can only be deleted once nothing is attached to them, which is why the containers go first.
+
+**One thing worth trying before you clean up:** delete just the db container and recreate it, then check `/history` - the predictions are gone. Container filesystems die with the container. That problem (and its fix, volumes) is the next lesson.
 
 ## Troubleshooting
 
-- **curl hangs from outside but works via `docker exec`** - the app is bound to 127.0.0.1; the CMD needs `--host 0.0.0.0`
-- **port is already allocated** - something else is on 8000, use `-p 8001:8000`
-- **STATUS shows (unhealthy)** - check `docker logs inference` and hit /health from inside via exec
-- **Cannot connect to the Docker daemon** - the engine isn't running; start Docker Desktop or `colima start`
+- **`docker logs api` shows all 10 retries then a crash** - the db container isn't on the same network, or isn't running. Check `docker ps` and that both used `--network app-net`.
+- **`curl localhost:8000` connection refused** - the API container exited (check `docker ps -a` and `docker logs api`) or you forgot `-p 8000:8000`.
+- **`port is already allocated`** - something else owns 8000; use `-p 8001:8000` and curl `:8001`.
+- **`could not translate host name "db"` from the API itself** - you're on the DEFAULT bridge (no DNS there). Both containers need the custom network.
 
-## Cleanup
+## The takeaway
 
-```bash
-docker stop inference && docker rm inference
-```
-
-## Ideas for extending it
-
-- convert to a multi-stage build and compare image sizes
-- scan the image with Trivy and fix anything HIGH/CRITICAL
-- add a GitHub Actions workflow that builds and pushes on every commit, tagged with the git SHA
-- replace `x * 2` with a real scikit-learn model - the container setup barely changes, which is the whole point
+Create a network, name your containers meaningfully, let them find each other by name, and publish a port only for the service that faces the outside. That is the pattern behind every multi-container app - and it's exactly what Docker Compose automates in the next lesson.
 
 ---
 
