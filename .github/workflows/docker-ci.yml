@@ -45,7 +45,7 @@ jobs:
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasecurity/trivy:0.58.1 image \
+            aquasec/trivy:0.58.1 image \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             --ignore-unfixed \
