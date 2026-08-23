@@ -1,4 +1,4 @@
-# Docker Networking Demo - API + Database on a Custom Network
+# Docker Networking Demo - API & Database on a Custom Network
 
 Two containers talking to each other by name: a FastAPI prediction service and a PostgreSQL database, connected over a user-defined Docker network. Every prediction the API makes is stored in the database and can be read back through a `/history` endpoint.
 
